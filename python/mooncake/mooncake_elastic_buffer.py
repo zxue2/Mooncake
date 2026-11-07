@@ -985,7 +985,9 @@ class ElasticBuffer:
 
     def get_theoretical_num_sms(self, num_experts: int, num_topk: int) -> int:
         if _ep_device_type() == "xpu":
-            # The XPU kernels size their grids themselves and ignore num_sms.
+            # The XPU kernels ignore num_sms unless
+            # MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE is set; then it
+            # caps their work-groups, with the same defaults as on CUDA.
             props = torch.xpu.get_device_properties(torch.xpu.current_device())
             sm_count = int(getattr(props, "max_compute_units", 1))
         else:
