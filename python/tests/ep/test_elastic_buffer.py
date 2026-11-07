@@ -45,6 +45,14 @@ def import_torchada_if_needed() -> None:
     import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
 
 
+# Intel GPUs run the same checks through torch.xpu and the xccl backend.
+DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
+
+
+def synchronize() -> None:
+    getattr(torch, DEVICE).synchronize()
+
+
 def distributed_barrier() -> None:
     if using_musa_backend():
         dist.barrier(device_ids=[torch.cuda.current_device()])
@@ -69,9 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument(
         "--transport",
-        choices=("auto", "ibgda", "nccl"),
+        choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
-        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA.",
+        help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA. "
+        "XPU supports only auto/ipc (single node).",
     )
     parser.add_argument(
         "--route",
@@ -101,13 +110,14 @@ def parse_args() -> argparse.Namespace:
 def init_distributed(seed: int) -> tuple[int, int, int]:
     import_torchada_if_needed()
     if not dist.is_initialized():
-        dist.init_process_group("nccl")
+        dist.init_process_group("xccl" if DEVICE == "xpu" else "nccl")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-    torch.cuda.set_device(local_rank)
-    torch.set_default_device("cuda")
+    accelerator = getattr(torch, DEVICE)
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % accelerator.device_count()))
+    accelerator.set_device(local_rank)
+    torch.set_default_device(DEVICE)
     torch.set_default_dtype(torch.bfloat16)
     torch.manual_seed(seed + rank)
     return rank, local_rank, world_size
@@ -128,7 +138,7 @@ def make_route_plan(
         raise ValueError("num_experts must be at least world_size")
 
     expert_offsets = (
-        torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+        torch.arange(num_topk, device=DEVICE, dtype=torch.long) % local_experts
     )
 
     if route == "cross" and buffer.num_scaleout_ranks > 1:
@@ -150,7 +160,7 @@ def make_route_plan(
         )
 
     dst_ranks = (
-        rank + torch.arange(num_topk, device="cuda", dtype=torch.long)
+        rank + torch.arange(num_topk, device=DEVICE, dtype=torch.long)
     ) % world_size
     choices = dst_ranks * local_experts + expert_offsets
     unique_dst_ranks = int(torch.unique(dst_ranks).numel())
@@ -164,7 +174,7 @@ def make_route_plan(
 def make_input(
     *, rank: int, num_tokens: int, hidden: int, multiplier: int, addend: int = 0
 ) -> torch.Tensor:
-    base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
+    base = torch.arange(num_tokens * hidden, device=DEVICE, dtype=torch.float32)
     base = base.view(num_tokens, hidden)
     return (base + rank * multiplier + addend).to(torch.bfloat16).contiguous()
 
@@ -194,7 +204,7 @@ def check_dispatch_payload(
     if not bool((src_token < num_tokens).all()):
         raise AssertionError(f"rank={rank}: invalid source token index in metadata")
 
-    base = torch.arange(num_tokens * hidden, device="cuda", dtype=torch.float32)
+    base = torch.arange(num_tokens * hidden, device=DEVICE, dtype=torch.float32)
     base = base.view(num_tokens, hidden)
     expected = base[src_token] + src_rank.view(-1, 1).float() * multiplier + addend
     expected = expected.to(torch.bfloat16)
@@ -252,7 +262,7 @@ def main() -> None:
         route=args.route,
     )
     weights = torch.ones(
-        (args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32
+        (args.num_tokens, args.num_topk), device=DEVICE, dtype=torch.float32
     )
 
     # CPU-sync dispatch: exact output extent and CPU-side expert counts.
@@ -273,7 +283,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     actual0 = check_dispatch_payload(
         rank=rank,
         recv_x=recv0,
@@ -296,7 +306,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expected0 = (x0.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined0, expected=expected0, label="sync")
 
@@ -316,7 +326,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     actual1 = check_dispatch_payload(
         rank=rank,
         recv_x=recv1,
@@ -337,7 +347,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expected1 = (x1.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined1, expected=expected1, label="cached")
 
@@ -361,7 +371,7 @@ def main() -> None:
         async_with_compute_stream=True,
     )
     event2.current_stream_wait()
-    torch.cuda.synchronize()
+    synchronize()
     actual2 = check_dispatch_payload(
         rank=rank,
         recv_x=recv2,
@@ -385,7 +395,7 @@ def main() -> None:
         async_with_compute_stream=True,
     )
     event3.current_stream_wait()
-    torch.cuda.synchronize()
+    synchronize()
     expected2 = (x2.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined2, expected=expected2, label="async")
 
@@ -402,7 +412,7 @@ def main() -> None:
         num_sms=args.num_sms,
         async_with_compute_stream=False,
     )
-    torch.cuda.synchronize()
+    synchronize()
     expanded_actual = int(
         expanded_handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
     )
@@ -460,7 +470,7 @@ def main() -> None:
             num_sms=args.num_sms,
             async_with_compute_stream=False,
         )
-        torch.cuda.synchronize()
+        synchronize()
         actual3 = check_dispatch_payload(
             rank=rank,
             recv_x=recv3,
@@ -479,7 +489,7 @@ def main() -> None:
             num_sms=args.num_sms,
             async_with_compute_stream=False,
         )
-        torch.cuda.synchronize()
+        synchronize()
         expected3 = (x3.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
         check_combined(
             rank=rank,
